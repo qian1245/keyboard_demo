@@ -1,0 +1,12 @@
+# 编译输出目录
+build/
+*.o
+*.out
+*.exe
+
+# VS Code 配置文件（可选）
+.vscode/
+
+# 操作系统生成的缓存文件
+.DS_Store
+Thumbs.db
