@@ -1,10 +1,15 @@
 #include "keyboard.h"
+#include "lvgl/lvgl.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define KEY_HEIGHT 110
 #define KEY_GAP 12
 #define BASE_U 115.0f
+
+// 声明 assets 中导入的 C 数组气泡贴图
+LV_IMAGE_DECLARE(bubble_dot);
 
 static int32_t get_key_width(float u) {
     return (int32_t)(u * BASE_U + (u - 1.0f) * KEY_GAP);
@@ -19,132 +24,174 @@ static KeyDef row5[] = {{"Ctrl", 1.25f}, {"Win", 1.25f}, {"Alt", 1.25f}, {"Space
 static KeyDef* layout[] = {row1, row2, row3, row4, row5};
 static int row_counts[] = {14, 14, 13, 12, 8};
 
-// ==================== 软 Q 水滴气泡动画逻辑 ====================
+// ==================== 物理水滴气泡粒子系统 ====================
 
-// 1. 上升回调
-static void bubble_rise_cb(void * var, int32_t v) { 
-    lv_obj_set_y((lv_obj_t *)var, v); 
-}
+typedef struct {
+    lv_obj_t * img;
+    float x, y;          // 实时中心坐标
+    float vx;            // X 轴左右散射速度
+    float target_vy;     // 目标匀速上浮速度
+    float current_vy;    // 实时上浮速度
+    float base_scale;    // 目标基础大小
+    float current_scale; // 动态缩放系数
+    float phase;         // 摇摆与形变相位
+    float phase_speed;   // 频率
+    float wobble_amp;    // S型波浪飘忽幅度
+    int32_t life;        // 剩余寿命 (帧数)
+    int32_t max_life;    // 总寿命
+} BubbleParticle;
 
-// 2. Q 弹形变回调：让气泡 X 轴拉伸（瘦高 <-> 胖扁）
-static void bubble_squish_x_cb(void * var, int32_t v) {
-    lv_obj_t * bubble = (lv_obj_t *)var;
-    // v 的基准为 256 (100% 原始比例)
-    // 改变 X 轴缩放，产生扁平/拉长的弹簧拉伸感
-    lv_obj_set_style_transform_scale_x(bubble, v, 0);
-}
+typedef struct {
+    BubbleParticle particles[5]; // 单次点击爆发 3 ~ 4 个动态气泡
+    int count;
+} BubbleBurst;
 
-// 3. Q 弹形变回调：让气泡 Y 轴反向拉伸（互补形变，保持总体体积感）
-static void bubble_squish_y_cb(void * var, int32_t v) {
-    lv_obj_t * bubble = (lv_obj_t *)var;
-    // 当 X 变宽时 Y 变窄，打造果冻水滴质感
-    int32_t v_y = 512 - v; // 反向拉伸
-    lv_obj_set_style_transform_scale_y(bubble, v_y, 0);
-}
+// 动画刷帧回调 (50 FPS)
+static void bubble_burst_timer_cb(lv_timer_t * timer) {
+    BubbleBurst * burst = (BubbleBurst *)lv_timer_get_user_data(timer);
+    if (!burst) return;
 
-// 4. 破裂消失渐变
-static void bubble_pop_fade_cb(void * var, int32_t v) {
-    lv_obj_t * bubble = (lv_obj_t *)var;
-    lv_obj_set_style_opa(bubble, v, 0);
-    // 破裂瞬间剧烈膨胀
-    int32_t scale = 256 + (255 - v) * 2; 
-    lv_obj_set_style_transform_scale(bubble, scale, 0);
-}
+    int active_count = 0;
 
-static void bubble_delete_cb(lv_anim_t * a) { 
-    lv_obj_delete((lv_obj_t *)a->var); 
-}
+    for (int i = 0; i < burst->count; i++) {
+        BubbleParticle * p = &burst->particles[i];
+        if (p->life <= 0) continue;
 
-// 到达顶端破裂触发
-static void bubble_pop_trigger_cb(lv_anim_t * a) {
-    lv_obj_t * bubble = (lv_obj_t *)a->var;
-    // 停止软 Q 形变动画
-    lv_anim_delete(bubble, bubble_squish_x_cb);
+        p->life--;
+        active_count++;
 
-    // 播放炸裂淡出动画
-    lv_anim_t a_pop;
-    lv_anim_init(&a_pop);
-    lv_anim_set_var(&a_pop, bubble);
-    lv_anim_set_values(&a_pop, 255, 0);
-    lv_anim_set_time(&a_pop, 200);
-    lv_anim_set_path_cb(&a_pop, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a_pop, bubble_pop_fade_cb);
-    lv_anim_set_ready_cb(&a_pop, bubble_delete_cb);
-    lv_anim_start(&a_pop);
-}
+        // 生命周期比例 (0.0 -> 1.0)
+        float life_ratio = (float)(p->max_life - p->life) / (float)p->max_life;
 
-// 按钮按下事件：生成水滴气泡
-static void btn_bubble_event_cb(lv_event_t * e) {
-    lv_obj_t * btn = lv_event_get_target(e);
-    lv_obj_t * label = lv_obj_get_child(btn, 0);
-    if(label) {
-        printf("[KEYBOARD] 水滴气泡: %s\n", lv_label_get_text(label));
+        // 1. 上浮速度曲线：前 20% 寿命加速，后续匀速
+        float accel_phase = 0.20f;
+        if (life_ratio < accel_phase) {
+            p->current_vy = p->target_vy * (life_ratio / accel_phase);
+        } else {
+            p->current_vy = p->target_vy;
+        }
+
+        // 2. 位置演进：Y 轴上升，X 轴叠加微幅 S 型波浪
+        p->phase += p->phase_speed;
+        p->y -= p->current_vy;
+        p->x += p->vx + sinf(p->phase) * p->wobble_amp;
+
+        // 3. 入场缩放 (0 ~ 12% 阶段弹出)
+        if (life_ratio < 0.12f) {
+            p->current_scale = p->base_scale * (life_ratio / 0.12f) * 1.1f;
+        } else {
+            float t = (life_ratio - 0.12f) / 0.88f;
+            p->current_scale = p->base_scale * (1.1f - 0.1f * t);
+        }
+
+        // 4. 柔和形变 (6% 轻微水滴波动)
+        float squish = sinf(p->phase * 1.8f) * 0.06f; 
+        float scale_x_factor = p->current_scale * (1.0f + squish);
+        float scale_y_factor = p->current_scale * (1.0f - squish);
+
+        // LVGL 9 缩放转换：256 为 100%
+        int32_t scale_x = (int32_t)(scale_x_factor * 256.0f);
+        int32_t scale_y = (int32_t)(scale_y_factor * 256.0f);
+
+        // 5. 自然渐隐 (末端 25% 生命周期淡出)
+        uint8_t opa = 255;
+        if (life_ratio > 0.75f) {
+            opa = (uint8_t)(255.0f * (1.0f - (life_ratio - 0.75f) / 0.25f));
+        }
+
+        // 6. 更新 LVGL 控件属性
+        lv_image_set_scale_x(p->img, scale_x);
+        lv_image_set_scale_y(p->img, scale_y);
+        lv_image_set_rotation(p->img, (int32_t)(sinf(p->phase) * 80.0f));
+        lv_obj_set_style_opa(p->img, opa, 0);
+
+        // 保持中心点对齐
+        int32_t img_w = bubble_dot.header.w;
+        int32_t img_h = bubble_dot.header.h;
+        lv_obj_set_pos(p->img, (int32_t)(p->x - img_w / 2), (int32_t)(p->y - img_h / 2));
+
+        // 气泡生命周期结束，回收资源
+        if (p->life <= 0) {
+            lv_obj_delete(p->img);
+            p->img = NULL;
+        }
     }
 
-    // 获取按键物理中心
+    // 所有气泡消失后，销毁定时器与内存
+    if (active_count == 0) {
+        free(burst);
+        lv_timer_delete(timer);
+    }
+}
+
+// 点击触发产生气泡群
+static void trigger_bubble_burst_effect(lv_obj_t * btn) {
+    lv_obj_t * parent = lv_screen_active();
+
+    // 获取点击按键的中心物理坐标
     lv_area_t btn_area;
     lv_obj_get_coords(btn, &btn_area);
-    int32_t center_x = btn_area.x1 + lv_area_get_width(&btn_area) / 2;
-    int32_t center_y = btn_area.y1 + lv_area_get_height(&btn_area) / 2;
+    float center_x = (float)(btn_area.x1 + lv_area_get_width(&btn_area) / 2);
+    float center_y = (float)(btn_area.y1 + lv_area_get_height(&btn_area) / 2);
 
-    // 创建气泡本体
-    lv_obj_t * bubble = lv_obj_create(lv_screen_active());
-    int32_t base_size = 28 + (rand() % 12); // 基础尺寸
-    lv_obj_set_size(bubble, base_size, base_size);
-    lv_obj_set_pos(bubble, center_x - base_size/2, center_y - base_size/2);
-    lv_obj_remove_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
+    BubbleBurst * burst = (BubbleBurst *)calloc(1, sizeof(BubbleBurst));
+    if (!burst) return;
 
-    // 高透亮水滴渲染样式
-    lv_obj_set_style_radius(bubble, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(bubble, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_bg_opa(bubble, LV_OPA_20, 0);                   // 薄水膜质感
-    lv_obj_set_style_border_color(bubble, lv_color_hex(0x66ffff), 0);  // 亮青高光边
-    lv_obj_set_style_border_width(bubble, 2, 0);
-    lv_obj_set_style_shadow_color(bubble, lv_color_hex(0x00d2ff), 0);  // 水韵蓝发光
-    lv_obj_set_style_shadow_width(bubble, 12, 0);
+    burst->count = 3 + (rand() % 2);
 
-    // --- 动画 1: 从极小瞬间爆发变大，带有弹簧冲过头（OverShoot）的回弹质感 ---
-    lv_anim_t a_scale;
-    lv_anim_init(&a_scale);
-    lv_anim_set_var(&a_scale, bubble);
-    // 从 10% 原始大小 (25) 快速弹射到 100% (256)
-    lv_anim_set_values(&a_scale, 25, 256);
-    lv_anim_set_time(&a_scale, 350);
-    // 使用 overshoots 路径：像按压水滴突然释放一样弹开
-    lv_anim_set_path_cb(&a_scale, lv_anim_path_overshoot);
-    lv_anim_set_exec_cb(&a_scale, (lv_anim_exec_xcb_t)lv_obj_set_style_transform_scale);
-    lv_anim_start(&a_scale);
+    int32_t img_w = bubble_dot.header.w;
+    int32_t img_h = bubble_dot.header.h;
 
-    // --- 动画 2: 软 QQ 呼吸拉伸（胖瘦交替） ---
-    lv_anim_t a_squish;
-    lv_anim_init(&a_squish);
-    lv_anim_set_var(&a_squish, bubble);
-    // 在 75% 宽度（瘦高）到 125% 宽度（胖扁）之间震荡
-    lv_anim_set_values(&a_squish, 190, 320); 
-    int32_t squish_time = 400 + (rand() % 200);
-    lv_anim_set_time(&a_squish, squish_time);
-    lv_anim_set_playback_time(&a_squish, squish_time);
-    lv_anim_set_repeat_count(&a_squish, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&a_squish, lv_anim_path_ease_in_out);
-    lv_anim_set_exec_cb(&a_squish, bubble_squish_x_cb);
-    lv_anim_start(&a_squish);
+    for (int i = 0; i < burst->count; i++) {
+        BubbleParticle * p = &burst->particles[i];
 
-    // Y 轴互补形变
-    lv_anim_t a_squish_y = a_squish;
-    lv_anim_set_exec_cb(&a_squish_y, bubble_squish_y_cb);
-    lv_anim_start(&a_squish_y);
+        p->img = lv_image_create(parent);
+        lv_image_set_src(p->img, &bubble_dot);
+        lv_image_set_pivot(p->img, img_w / 2, img_h / 2);
+        lv_obj_remove_flag(p->img, LV_OBJ_FLAG_CLICKABLE);
 
-    // --- 动画 3: 水中自然减速上浮 ---
-    lv_anim_t a_y;
-    lv_anim_init(&a_y);
-    lv_anim_set_var(&a_y, bubble);
-    lv_anim_set_values(&a_y, center_y - base_size/2, 20); 
-    lv_anim_set_time(&a_y, 1600 + (rand() % 400));
-    // ease_out: 刚吐出时速度快，越往水面阻力越大越慢
-    lv_anim_set_path_cb(&a_y, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a_y, bubble_rise_cb);
-    lv_anim_set_ready_cb(&a_y, bubble_pop_trigger_cb);
-    lv_anim_start(&a_y);
+        // 初始化物理属性
+        p->x = center_x + (float)((rand() % 20) - 10);
+        p->y = center_y + (float)((rand() % 10) - 5);
+        p->vx = ((rand() % 100) - 50) / 60.0f;               
+        p->current_vy = 0.0f;                                
+
+        // 【差异化设置：主大气泡 vs 副小气泡】
+        if (i == 0) {
+            // 主大气泡：速度稍快，寿命较短 (约 0.6 秒)
+            p->base_scale = 0.30f + (float)(rand() % 8) / 100.0f; 
+            p->target_vy = 3.5f + (float)(rand() % 15) / 10.0f; 
+            p->max_life = 32 + (rand() % 8);                   
+        } else {
+            // 【关键点】：小气泡大幅延长寿命 (约 1.2 ~ 1.7 秒)，上升速度调小，显得更小巧轻盈
+            p->base_scale = 0.13f + (float)(rand() % 10) / 100.0f; 
+            p->target_vy = 1.8f + (float)(rand() % 12) / 10.0f; 
+            p->max_life = 65 + (rand() % 25);                  
+        }
+
+        p->current_scale = 0.0f;
+        p->phase = (float)(rand() % 360) * 0.01745f;
+        p->phase_speed = 0.06f + (float)(rand() % 8) / 100.0f;
+        p->wobble_amp = 0.6f + (float)(rand() % 10) / 10.0f; 
+        p->life = p->max_life;
+
+        // 初始第 1 帧定位在按键中心，隐藏尺寸
+        lv_image_set_scale(p->img, 0);
+        lv_obj_set_pos(p->img, (int32_t)(p->x - img_w / 2), (int32_t)(p->y - img_h / 2));
+        lv_obj_move_foreground(p->img);
+    }
+
+    // 启动 20ms (50 FPS) 定时器
+    lv_timer_create(bubble_burst_timer_cb, 20, burst);
+}
+
+static void btn_bubble_event_cb(lv_event_t * e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * btn = lv_event_get_target(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        trigger_bubble_burst_effect(btn);
+    }
 }
 
 // 搭建界面布局
@@ -171,6 +218,7 @@ void create_keyboard_ui(void) {
     lv_obj_set_style_border_width(main_cont, 0, 0);
     lv_obj_set_flex_flow(main_cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(main_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
     lv_obj_set_style_pad_row(main_cont, KEY_GAP, 0);
 
     lv_obj_remove_flag(main_cont, LV_OBJ_FLAG_SCROLLABLE);
@@ -200,7 +248,6 @@ void create_keyboard_ui(void) {
             lv_obj_t * label = lv_label_create(btn);
             lv_label_set_text(label, layout[r][k].label);
             lv_obj_center(label);
-            lv_obj_set_style_text_opa(label, LV_OPA_TRANSP, 0);
 
             lv_obj_add_event_cb(btn, btn_bubble_event_cb, LV_EVENT_PRESSED, NULL);
         }
