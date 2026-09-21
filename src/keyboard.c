@@ -2,6 +2,7 @@
 #include "lvgl/lvgl.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #define KEY_HEIGHT 110
@@ -39,10 +40,11 @@ typedef struct {
     float wobble_amp;    // S型波浪飘忽幅度
     int32_t life;        // 剩余寿命 (帧数)
     int32_t max_life;    // 总寿命
+    int is_persistent;   // 是否为穿屏不消失的特殊气泡
 } BubbleParticle;
 
 typedef struct {
-    BubbleParticle particles[5]; // 单次点击爆发 3 ~ 4 个动态气泡
+    BubbleParticle particles[35]; // 扩充容量以支持空格键大量小气泡
     int count;
 } BubbleBurst;
 
@@ -52,23 +54,33 @@ static void bubble_burst_timer_cb(lv_timer_t * timer) {
     if (!burst) return;
 
     int active_count = 0;
+    int32_t img_h = bubble_dot.header.h;
 
     for (int i = 0; i < burst->count; i++) {
         BubbleParticle * p = &burst->particles[i];
         if (p->life <= 0) continue;
 
-        p->life--;
+        // 特殊气泡不递减寿命，由顶部边界控制销毁
+        if (!p->is_persistent) {
+            p->life--;
+        }
         active_count++;
 
-        // 生命周期比例 (0.0 -> 1.0)
-        float life_ratio = (float)(p->max_life - p->life) / (float)p->max_life;
+        float life_ratio = 0.0f;
+        if (!p->is_persistent) {
+            life_ratio = (float)(p->max_life - p->life) / (float)p->max_life;
+        }
 
-        // 1. 上浮速度曲线：前 20% 寿命加速，后续匀速
-        float accel_phase = 0.20f;
-        if (life_ratio < accel_phase) {
-            p->current_vy = p->target_vy * (life_ratio / accel_phase);
+        // 1. 上浮速度曲线
+        if (!p->is_persistent) {
+            float accel_phase = 0.20f;
+            if (life_ratio < accel_phase) {
+                p->current_vy = p->target_vy * (life_ratio / accel_phase);
+            } else {
+                p->current_vy = p->target_vy;
+            }
         } else {
-            p->current_vy = p->target_vy;
+            p->current_vy = p->target_vy; // 持续匀速向上飘
         }
 
         // 2. 位置演进：Y 轴上升，X 轴叠加微幅 S 型波浪
@@ -76,68 +88,90 @@ static void bubble_burst_timer_cb(lv_timer_t * timer) {
         p->y -= p->current_vy;
         p->x += p->vx + sinf(p->phase) * p->wobble_amp;
 
-        // 3. 入场缩放 (0 ~ 12% 阶段弹出)
-        if (life_ratio < 0.12f) {
-            p->current_scale = p->base_scale * (life_ratio / 0.12f) * 1.1f;
-        } else {
-            float t = (life_ratio - 0.12f) / 0.88f;
-            p->current_scale = p->base_scale * (1.1f - 0.1f * t);
-        }
-
-        // 4. 柔和形变 (6% 轻微水滴波动)
-        float squish = sinf(p->phase * 1.8f) * 0.06f; 
-        float scale_x_factor = p->current_scale * (1.0f + squish);
-        float scale_y_factor = p->current_scale * (1.0f - squish);
-
-        // LVGL 9 缩放转换：256 为 100%
-        int32_t scale_x = (int32_t)(scale_x_factor * 256.0f);
-        int32_t scale_y = (int32_t)(scale_y_factor * 256.0f);
-
-        // 5. 自然渐隐 (末端 25% 生命周期淡出)
+        int32_t scale_x = 256, scale_y = 256;
         uint8_t opa = 255;
-        if (life_ratio > 0.75f) {
-            opa = (uint8_t)(255.0f * (1.0f - (life_ratio - 0.75f) / 0.25f));
+
+        if (p->is_persistent) {
+            // 穿屏气泡：保持固定微小尺寸，不渐隐，直到完全飞出屏幕顶部
+            p->current_scale = p->base_scale;
+            scale_x = (int32_t)(p->current_scale * 256.0f);
+            scale_y = (int32_t)(p->current_scale * 256.0f);
+            opa = 255;
+
+            // 当气泡完全超出屏幕顶部时销毁
+            if (p->y + img_h < 0) {
+                p->life = 0;
+            }
+        } else {
+            // 3. 普通气泡：入场缩放，保持稳定大小
+            if (life_ratio < 0.12f) {
+                p->current_scale = p->base_scale * (life_ratio / 0.12f) * 1.1f;
+            } else {
+                p->current_scale = p->base_scale; 
+            }
+
+            // 4. 柔和形变
+            float squish = sinf(p->phase * 1.8f) * 0.06f; 
+            float scale_x_factor = p->current_scale * (1.0f + squish);
+            float scale_y_factor = p->current_scale * (1.0f - squish);
+
+            scale_x = (int32_t)(scale_x_factor * 256.0f);
+            scale_y = (int32_t)(scale_y_factor * 256.0f);
+
+            // 5. 单纯的透明度渐隐（后 40% 生命周期开始淡出）
+            if (life_ratio > 0.6f) {
+                float fade_progress = (life_ratio - 0.6f) / 0.4f; 
+                opa = (uint8_t)(255.0f * (1.0f - fade_progress));
+            }
         }
 
         // 6. 更新 LVGL 控件属性
         lv_image_set_scale_x(p->img, scale_x);
         lv_image_set_scale_y(p->img, scale_y);
-        lv_image_set_rotation(p->img, (int32_t)(sinf(p->phase) * 80.0f));
+        lv_image_set_rotation(p->img, (int32_t)(sinf(p->phase) * 60.0f));
         lv_obj_set_style_opa(p->img, opa, 0);
 
         // 保持中心点对齐
         int32_t img_w = bubble_dot.header.w;
-        int32_t img_h = bubble_dot.header.h;
         lv_obj_set_pos(p->img, (int32_t)(p->x - img_w / 2), (int32_t)(p->y - img_h / 2));
 
-        // 气泡生命周期结束，回收资源
         if (p->life <= 0) {
             lv_obj_delete(p->img);
             p->img = NULL;
         }
     }
 
-    // 所有气泡消失后，销毁定时器与内存
     if (active_count == 0) {
         free(burst);
         lv_timer_delete(timer);
     }
 }
 
-// 点击触发产生气泡群
+// 点击触发产生气泡群（小气泡占比多、纵坐标与速度错落）
 static void trigger_bubble_burst_effect(lv_obj_t * btn) {
     lv_obj_t * parent = lv_screen_active();
 
-    // 获取点击按键的中心物理坐标
     lv_area_t btn_area;
     lv_obj_get_coords(btn, &btn_area);
-    float center_x = (float)(btn_area.x1 + lv_area_get_width(&btn_area) / 2);
-    float center_y = (float)(btn_area.y1 + lv_area_get_height(&btn_area) / 2);
+
+    // 检查当前点击的是不是空格键
+    bool is_space = false;
+    lv_obj_t * label_child = lv_obj_get_child(btn, 0);
+    if (label_child) {
+        const char * txt = lv_label_get_text(label_child);
+        if (txt && strcmp(txt, "Space") == 0) {
+            is_space = true;
+        }
+    }
 
     BubbleBurst * burst = (BubbleBurst *)calloc(1, sizeof(BubbleBurst));
     if (!burst) return;
 
-    burst->count = 3 + (rand() % 2);
+    if (is_space) {
+        burst->count = 16 + (rand() % 8); // 空格键产生 16 ~ 23 个小气泡
+    } else {
+        burst->count = 4 + (rand() % 4);  // 普通按键产生 4 ~ 7 个气泡
+    }
 
     int32_t img_w = bubble_dot.header.w;
     int32_t img_h = bubble_dot.header.h;
@@ -150,38 +184,64 @@ static void trigger_bubble_burst_effect(lv_obj_t * btn) {
         lv_image_set_pivot(p->img, img_w / 2, img_h / 2);
         lv_obj_remove_flag(p->img, LV_OBJ_FLAG_CLICKABLE);
 
-        // 初始化物理属性
-        p->x = center_x + (float)((rand() % 20) - 10);
-        p->y = center_y + (float)((rand() % 10) - 5);
-        p->vx = ((rand() % 100) - 50) / 60.0f;               
-        p->current_vy = 0.0f;                                
+        if (is_space) {
+            // 【空格键逻辑】：全是小气泡，横向铺满，纵向范围错落
+            int btn_w = lv_area_get_width(&btn_area);
+            int btn_h = lv_area_get_height(&btn_area);
+            p->x = (float)btn_area.x1 + (float)(rand() % (btn_w > 0 ? btn_w : 1));
+            p->y = (float)btn_area.y1 + (float)(rand() % (btn_h > 0 ? btn_h : 1)); // 纵坐标在按键内部高低错落
+            p->vx = ((rand() % 50) - 25) / 100.0f;               
+            p->current_vy = 0.0f;                                
+            p->is_persistent = 0;
 
-        // 【差异化设置：主大气泡 vs 副小气泡】
-        if (i == 0) {
-            // 主大气泡：速度稍快，寿命较短 (约 0.6 秒)
-            p->base_scale = 0.30f + (float)(rand() % 8) / 100.0f; 
-            p->target_vy = 3.5f + (float)(rand() % 15) / 10.0f; 
-            p->max_life = 32 + (rand() % 8);                   
+            // 细小气泡，但大小和速度各有不同，避免死板
+            p->base_scale = 0.08f + (float)(rand() % 10) / 100.0f; // 0.08 ~ 0.17
+            p->target_vy = 0.8f + (float)(rand() % 15) / 10.0f;   // 0.8 ~ 2.3 速度错开
+            p->max_life = 55 + (rand() % 35);                    
         } else {
-            // 【关键点】：小气泡大幅延长寿命 (约 1.2 ~ 1.7 秒)，上升速度调小，显得更小巧轻盈
-            p->base_scale = 0.13f + (float)(rand() % 10) / 100.0f; 
-            p->target_vy = 1.8f + (float)(rand() % 12) / 10.0f; 
-            p->max_life = 65 + (rand() % 25);                  
+            // 【普通按键逻辑】：纵坐标大幅错开，小气泡占绝大多数
+            float center_x = (float)(btn_area.x1 + lv_area_get_width(&btn_area) / 2);
+            float center_y = (float)(btn_area.y1 + lv_area_get_height(&btn_area) / 2);
+
+            // 纵坐标和横坐标上下左右错开，不再在同一水平线上产生
+            p->x = center_x + (float)((rand() % 30) - 15);
+            p->y = center_y + (float)((rand() % 26) - 13); // 纵坐标上下分散
+            p->vx = ((rand() % 60) - 30) / 100.0f;               
+            p->current_vy = 0.0f;                                
+
+            int type_rand = rand() % 100;
+            if (i == 0 && type_rand < 15) {
+                // 极少概率出现的大气泡（慢速）
+                p->base_scale = 0.24f + (float)(rand() % 6) / 100.0f; 
+                p->target_vy = 0.7f + (float)(rand() % 4) / 10.0f;  
+                p->max_life = 90 + (rand() % 20);                  
+                p->is_persistent = 0;
+            } else if (type_rand >= 85) {
+                // 极少概率出现的穿屏气泡
+                p->base_scale = 0.08f + (float)(rand() % 4) / 100.0f; 
+                p->target_vy = 0.6f + (float)(rand() % 4) / 10.0f;  
+                p->max_life = 999999;                                
+                p->is_persistent = 1;                                
+            } else {
+                // 大多数都是小气泡，但彼此的体积和速度各不相同
+                p->base_scale = 0.09f + (float)(rand() % 10) / 100.0f; // 0.09 ~ 0.18
+                p->target_vy = 1.0f + (float)(rand() % 12) / 10.0f;  // 1.0 ~ 2.2 速度差异明显
+                p->max_life = 55 + (rand() % 35);                  
+                p->is_persistent = 0;
+            }
         }
 
         p->current_scale = 0.0f;
         p->phase = (float)(rand() % 360) * 0.01745f;
-        p->phase_speed = 0.06f + (float)(rand() % 8) / 100.0f;
-        p->wobble_amp = 0.6f + (float)(rand() % 10) / 10.0f; 
+        p->phase_speed = 0.03f + (float)(rand() % 5) / 100.0f; 
+        p->wobble_amp = 0.15f + (float)(rand() % 10) / 30.0f;    
         p->life = p->max_life;
 
-        // 初始第 1 帧定位在按键中心，隐藏尺寸
         lv_image_set_scale(p->img, 0);
         lv_obj_set_pos(p->img, (int32_t)(p->x - img_w / 2), (int32_t)(p->y - img_h / 2));
         lv_obj_move_foreground(p->img);
     }
 
-    // 启动 20ms (50 FPS) 定时器
     lv_timer_create(bubble_burst_timer_cb, 20, burst);
 }
 
